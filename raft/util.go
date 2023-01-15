@@ -21,3 +21,19 @@ func randDuration(startMs, endMs int) time.Duration {
 	r := rand.Intn(endMs-startMs+1) + startMs
 	return time.Duration(r) * time.Millisecond
 }
+
+// Returns the minimum of two integers.
+func min(x, y int) int {
+	if x <= y {
+		return x
+	}
+	return y
+}
+
+// Returns the maximum of two integers.
+func max(x, y int) int {
+	if x >= y {
+		return x
+	}
+	return y
+}

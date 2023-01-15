@@ -1,104 +1,68 @@
 package raft
 
 import (
-	"context"
 	"time"
 )
 
-type electionResult struct {
-	// Outcome of processing all request vote replies.
-	// Won, Lost, Split, OutOfDate or Cancelled.
-	outcome int
-
-	// Populated if the outcome is OutOfDate.
-	term int
-}
-
-type serverRequestVoteReply struct {
+type requestVoteResult struct {
 	// Server associated with reply.
 	server int
 
+	// Term when the RPC was sent
+	sentTerm int
+
 	// The RPC reply.
 	reply *RequestVoteReply
+
+	// Set if the RPC was successful (i.e. not dropped).
+	success bool
 }
 
-// Run an election. Become a candidate, increment the term and vote for self.
-// Send out request votes and become leader if election is won.
-func (rf *Raft) election(ctx context.Context) {
+// Become a candidate and run an election. Sends out RequestVote RPC's to
+// all other servers and handles the results.
+func (rf *Raft) election() {
 	rf.mu.Lock()
 
-	// Ensure not leader or killed
 	if rf.isLeader() || rf.killed() {
 		rf.mu.Unlock()
 		return
 	}
 
-	term := rf.currentTerm + 1
 	rf.becomeCandidate()
-	rf.maybeUpdateTerm(term)
+	rf.increaseTerm(rf.currentTerm + 1)
 	rf.vote(rf.me)
 
-	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: rf.log.index,
-		LastLogTerm:  rf.log.lastTerm,
-	}
+	resultCh := make(chan requestVoteResult, len(rf.peers)-1)
+	rf.sendRequestVotes(resultCh)
 
-	replyCh := make(chan serverRequestVoteReply, rf.nPeers-1)
-	rf.sendRequestVotes(replyCh, args)
-	rf.mu.Unlock()
-
-	// Await replies until all servers responded or cancelled.
-	result := rf.gatherRequestVoteReplies(replyCh, term, ctx)
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	switch result.outcome {
-	case Won:
-		rf.becomeLeader()
-	case Lost:
-		rf.maybeBecomeFollower()
-	case Split, Cancelled:
-	case OutOfDate:
-		if result.term > rf.currentTerm {
-			rf.maybeUpdateTerm(result.term)
-			rf.maybeBecomeFollower()
+	votes := 1
+	for i := 0; i < len(rf.peers)-1; i++ {
+		if !rf.isCandidate() || rf.killed() {
+			break
 		}
+		rf.mu.Unlock()
+		result := <-resultCh
+		rf.mu.Lock()
+		rf.handleRequestVoteResult(result, &votes)
 	}
+	rf.mu.Unlock()
 }
 
-// Handles the election timeout and elections. The timeout can be stopped by
-// sending a value on the stop channel and reset by sending a value on the
-// reset channel. When a new election is run the previous one will be cancelled
-// if it is still running.
+// Handles the election timeout and runs elections. Can be stopped by
+// sending a value on the stop channel and reset by sending a
+// value on the reset channel.
 func (rf *Raft) runElectionTimeout() {
-	ctx := context.Background()
-	var cancelPrev context.CancelFunc
-	var electionTimeout *time.Timer
-
-loop:
 	for {
 		duration := randDuration(ElectionTimeoutLow, ElectionTimeoutHigh)
-		electionTimeout = time.NewTimer(duration)
-		ctx, cancel := context.WithCancel(ctx)
-		defer electionTimeout.Stop()
+		electionTimeout := time.NewTimer(duration)
 		select {
 		case <-electionTimeout.C:
-			if cancelPrev != nil {
-				cancelPrev()
-			}
-			go rf.election(ctx)
-			cancelPrev = cancel
+			go rf.election()
 		case <-rf.resetElectCh:
-			cancel()
+			electionTimeout.Stop()
 		case <-rf.stopElectCh:
-			if cancelPrev != nil {
-				cancelPrev()
-			}
-			cancel()
-			break loop
+			electionTimeout.Stop()
+			return
 		}
 	}
 }
@@ -107,9 +71,7 @@ loop:
 func (rf *Raft) resetElectionTimeout() {
 	select {
 	case rf.resetElectCh <- struct{}{}:
-		// Sent reset. Log.
 	default:
-		// Reset already sent. Do nothing.
 	}
 }
 
@@ -117,59 +79,65 @@ func (rf *Raft) resetElectionTimeout() {
 func (rf *Raft) stopElectionTimeout() {
 	select {
 	case rf.stopElectCh <- struct{}{}:
-		// Sent stop. Log.
 	default:
-		// Stop already sent. Do nothing.
 	}
 }
 
-// Gather all the available votes on the reply channel. Returns the result of
-// the election unless cancelled.
-func (rf *Raft) gatherRequestVoteReplies(replyCh <-chan serverRequestVoteReply, term int, ctx context.Context) electionResult {
-	votesFor := 1
-	votesAgainst := 0
-
-	for i := 0; i < rf.nPeers-1; i++ {
-		select {
-		case serverReply := <-replyCh:
-			if serverReply.reply.Term > term {
-				return electionResult{outcome: OutOfDate, term: serverReply.reply.Term}
-			}
-			if serverReply.reply.VoteGranted {
-				votesFor += 1
-			} else {
-				votesAgainst += 1
-			}
-		case <-ctx.Done():
-			// Cancelled due to election timeout.
-			return electionResult{outcome: Cancelled}
-		}
-		if votesFor >= rf.majority {
-			return electionResult{outcome: Won}
-		} else if votesAgainst >= rf.majority {
-			return electionResult{outcome: Lost}
-		}
+// Handles a single request vote result.
+func (rf *Raft) handleRequestVoteResult(result requestVoteResult, votes *int) {
+	// RPC reply failed.
+	if !result.success {
+		return
 	}
-	// Vote must be split if all votes processed and didn't win or lose.
-	return electionResult{outcome: Split}
+
+	// Our term is outdated.
+	if result.reply.Term > rf.currentTerm {
+		rf.increaseTerm(result.reply.Term)
+		rf.becomeFollower()
+		return
+	}
+
+	// The reply term is different than the one sent in the RPC.
+	if result.reply.Term != result.sentTerm {
+		return
+	}
+
+	if !result.reply.VoteGranted {
+		return
+	}
+
+	// Vote received.
+	*votes += 1
+
+	// Check if won election.
+	if *votes >= len(rf.peers)/2+1 {
+		rf.becomeLeader()
+	}
 }
 
-// Send out request votes asynchronously to all servers except self. Replies are sent to
-// the provided reply channel.
-func (rf *Raft) sendRequestVotes(replyCh chan<- serverRequestVoteReply, args *RequestVoteArgs) {
-	for i := 0; i < rf.nPeers; i++ {
+// Send out request votes asynchronously to all servers except self. Results
+// are sent on the the provided result channel.
+func (rf *Raft) sendRequestVotes(resultCh chan<- requestVoteResult) {
+	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
+
 		server := i
+		sentTerm := rf.currentTerm
+		lastIndex, lastTerm := rf.lastIndexAndTerm()
+
+		args := &RequestVoteArgs{
+			Term:         sentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: lastIndex,
+			LastLogTerm:  lastTerm,
+		}
+
 		go func() {
 			reply := &RequestVoteReply{}
 			ok := rf.sendRequestVote(server, args, reply)
-			if ok {
-				replyCh <- serverRequestVoteReply{server, reply}
-			} else {
-				// Failed to contact server. Log.
-			}
+			resultCh <- requestVoteResult{server, sentTerm, reply, ok}
 		}()
 	}
 }

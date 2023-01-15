@@ -1,27 +1,18 @@
 package raft
 
-// The states of a peer.
 const (
-	Follower = iota
-	Candidate
-	Leader
-)
+	// The states of a peer.
+	Follower = 0
+	Candidate = 1
+	Leader = 2
 
-// Outcomes of append entry or election reply processing.
-const (
-	Done = iota
-	OutOfDate
-	Cancelled
-	Won
-	Lost
-	Split
-)
-
-const (
 	// Heartbeats interval in ms.
-	HeartbeatsInterval = 50
+	HeartbeatsInterval = 100
 
 	// Election timeout range in ms.
-	ElectionTimeoutLow  = 300
-	ElectionTimeoutHigh = 450
+	ElectionTimeoutLow  = 800
+	ElectionTimeoutHigh = 1200
+
+	// Representation of a none value e.g. no one voted for.
+	None = -1
 )
