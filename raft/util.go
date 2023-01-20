@@ -17,7 +17,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 // Return a random duration in ms between startMs and endMs inclusive.
-func randDuration(startMs, endMs int) time.Duration {
+func durationBetween(startMs, endMs int) time.Duration {
 	r := rand.Intn(endMs-startMs+1) + startMs
 	return time.Duration(r) * time.Millisecond
 }
